@@ -109,8 +109,6 @@ class DiscoveryProxy:
     def saw_device(self, device):
         if device.key not in self._discovered:
             LOG.info('New device found at %s' % device.ip)
-            with open('%s.txt' % device.ip, 'a') as f:
-                f.writelines([repr(device.data) + '\n'])
         self._discovered[device.key] = device
 
     def process_loop(self):
