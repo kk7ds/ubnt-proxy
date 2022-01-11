@@ -28,15 +28,24 @@ class Device:
     def heartbeat(self):
         self.ts = time.time()
 
+    @property
+    def key(self):
+        # Seems like maybe the first four bytes are a service type.
+        # This differs by model of camera and for different services
+        # on the same unifi controller. Use this to make sure we store
+        # packets of multiple services on the same host, otherwise we
+        # won't advertise them all.
+        return self.data[:4] + self.ip.encode()
+
     def __hash__(self):
-        return self.ip
+        return self.key
 
 
 class DiscoveryProxy:
     """A cross-subnet Unifi Discovery proxy"""
 
-    def __init__(self, protect_if, mcast_group, disc_port, interval=10):
-        self._protect_if = protect_if
+    def __init__(self, disc_ifs, mcast_group, disc_port, interval=10):
+        self._disc_ifs = disc_ifs
         self._disc_port = disc_port
         self._interval = interval
 
@@ -46,9 +55,13 @@ class DiscoveryProxy:
         self.mcast_s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
                                 mreq)
 
-        self.disc_s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.disc_s.bind((self._protect_if, 0))
-        self.disc_s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        self.disc_socks = []
+        for iface in self._disc_ifs:
+            LOG.debug('Binding to %s' % iface)
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.bind((iface, 0))
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            self.disc_socks.append(s)
 
         self._last_discover = 0
         self._discovered = {}
@@ -57,16 +70,18 @@ class DiscoveryProxy:
         # If enough time has passed since our last attempt, do a discovery
         if time.time() - self._last_discover > self._interval:
             LOG.info('Sending discover')
-            self.disc_s.sendto(REQUEST, ('255.255.255.255', self._disc_port))
+            for i, s in zip(self._disc_ifs, self.disc_socks):
+                LOG.debug('Discovering on interface %s' % i)
+                s.sendto(REQUEST, ('255.255.255.255', self._disc_port))
             self._last_discover = time.time()
 
         # Expire any devices that we have not heard from in three
         # intervals
         now = time.time()
-        for ip, device in list(self._discovered.items()):
+        for key, device in list(self._discovered.items()):
             if (now - device.ts) > (self._interval * 3):
                 LOG.info('Expiring device at %s' % device.ip)
-                del self._discovered[device.ip]
+                del self._discovered[key]
 
     def feed_discovery(self, remote):
         if not self._discovered:
@@ -75,6 +90,8 @@ class DiscoveryProxy:
 
         LOG.info('Feeding %i discovered devices to %s:%i' % (
             len(self._discovered), *remote))
+        LOG.debug('Devices: %s' % ','.join(
+            d.ip for d in self._discovered.values()))
         # Feed all our discovered devices to a remote requester
         for device in self._discovered.values():
             packet = (scapy.all.IP(src=device.ip, dst=remote[0]) /
@@ -89,14 +106,22 @@ class DiscoveryProxy:
                 LOG.error('Unable to send spoofed packet; am I root?')
                 break
 
+    def saw_device(self, device):
+        if device.key not in self._discovered:
+            LOG.info('New device found at %s' % device.ip)
+            with open('%s.txt' % device.ip, 'a') as f:
+                f.writelines([repr(device.data) + '\n'])
+        self._discovered[device.key] = device
+
     def process_loop(self):
         while True:
-            r, _w, _x = select.select([self.mcast_s, self.disc_s], [], [], 10)
+            r, _w, _x = select.select([self.mcast_s] + self.disc_socks, [], [],
+                                      10)
             if self.mcast_s in r:
                 data, remote = self.mcast_s.recvfrom(1024)
                 LOG.debug('Multicast %s from %s:%i' % (
                     data == REQUEST and 'request' or 'response', *remote))
-                if data == REQUEST and remote[0] != self._protect_if:
+                if data == REQUEST and remote[0] not in self._disc_ifs:
                     # If this is a request packet from someone other
                     # than ourselves, we feed them the devices we know
                     # about. We also trigger another discovery if it
@@ -107,22 +132,22 @@ class DiscoveryProxy:
                     # time with a fresh list.
                     self.feed_discovery(remote)
                     self.discovery_tick()
-            if self.disc_s in r:
-                data, remote = self.disc_s.recvfrom(1024)
-                LOG.debug('Discovery %s from %s:%i' % (
-                    data == REQUEST and 'request' or 'response', *remote))
-                if data != REQUEST:
-                    device = Device(remote[0], data)
-                    if device.ip in self._discovered:
-                        self._discovered[device.ip].heartbeat()
-                    else:
-                        LOG.info('New device found at %s' % device.ip)
-                        self._discovered[device.ip] = device
+                elif data != REQUEST:
+                    self.saw_device(Device(remote[0], data))
+
+            for s in self.disc_socks:
+                if s in r:
+                    data, remote = s.recvfrom(1024)
+                    LOG.debug('Discovery %s from %s:%i' % (
+                        data == REQUEST and 'request' or 'response', *remote))
+                    if data != REQUEST:
+                        self.saw_device(Device(remote[0], data))
 
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('unifi_if', help='IP of the interface on the unifi subnet')
+    p.add_argument('unifi_if', nargs='+',
+                   help='IP of the interface on the unifi subnet')
     p.add_argument('-q', '--quiet', action='store_true',
                    help='Only report errors')
     p.add_argument('-d', '--debug', action='store_true',
