@@ -4,6 +4,7 @@ import argparse
 import socket
 import logging
 import select
+import struct
 import sys
 import time
 
@@ -11,6 +12,40 @@ import scapy.all
 
 REQUEST = bytes([1, 0, 0, 0])
 LOG = logging.getLogger('unifi_proxy')
+
+# Discovery packet:
+# 0-3 device id?
+# 4-6 ?
+# 7-12 MAC
+# 13-16 IP
+# ..
+# 33-39 MAC again?
+# 42-45 "unifi"
+# ..
+# 50-54 'UKCP'
+# 84 Version? "6.5.55"
+
+
+def format_mac(d):
+    return ':'.join('%02x' % b for b in d)
+
+
+def format_string(d):
+    return d.decode()
+
+
+def format_binary(d):
+    return ' '.join('%02x' % b for b in d)
+
+
+FIELDS = {
+    1: ('MAC', format_mac),
+    3: ('Firmware version', format_string),
+    11: ('Name', format_string),
+    12: ('Model', format_string),
+    22: ('Software Version', format_string),
+    32: ('UUID', format_string),
+}
 
 
 class Device:
@@ -20,6 +55,33 @@ class Device:
         self.ip = ip
         self.data = data
         self.heartbeat()
+        try:
+            self.parse()
+        except Exception as e:
+            LOG.debug('Failed to parse discovery packet: %s' % e,
+                      exc_info=True)
+            LOG.warning('Unsupported discovery packet from %s' % self.ip)
+        else:
+            LOG.debug('Device properties: %s' % self.attrs)
+
+    def parse(self):
+        self.attrs = {}
+
+        self.attrs['IP'] = '%i.%i.%i.%i' % struct.unpack('BBBB',
+                                                         self.data[13:17])
+
+        attrdata = self.data[17:]
+        while attrdata:
+            header = attrdata[:3]
+            attrdata = attrdata[3:]
+            field_id, length = struct.unpack('<HB', header)
+            payload = attrdata[:length]
+            attrdata = attrdata[length:]
+
+            field_name, formatter = FIELDS.get(field_id,
+                                               ('field-%i' % field_id,
+                                                format_binary))
+            self.attrs[field_name] = formatter(payload)
 
     @property
     def age(self):
@@ -108,7 +170,12 @@ class DiscoveryProxy:
 
     def saw_device(self, device):
         if device.key not in self._discovered:
-            LOG.info('New device found at %s' % device.ip)
+            try:
+                LOG.info('New %s device %r found at %s (version %s)' % (
+                    device.attrs['Model'], device.attrs['Name'],
+                    device.ip, device.attrs['Firmware version']))
+            except KeyError:
+                LOG.info('New device found at %s' % device.ip)
         self._discovered[device.key] = device
 
     def process_loop(self):
