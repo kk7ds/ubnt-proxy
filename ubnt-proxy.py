@@ -10,20 +10,11 @@ import time
 
 import scapy.all
 
-REQUEST = bytes([1, 0, 0, 0])
+# Apparently there are two types of request packets, the first seems
+# to be from protect, the second maybe network?
+REQUEST = [bytes([1, 0, 0, 0]),
+           bytes([2, 8, 0, 0])]
 LOG = logging.getLogger('unifi_proxy')
-
-# Discovery packet:
-# 0-3 device id?
-# 4-6 ?
-# 7-12 MAC
-# 13-16 IP
-# ..
-# 33-39 MAC again?
-# 42-45 "unifi"
-# ..
-# 50-54 'UKCP'
-# 84 Version? "6.5.55"
 
 
 def format_mac(d):
@@ -54,6 +45,7 @@ class Device:
     def __init__(self, ip, data):
         self.ip = ip
         self.data = data
+        self.recv_addr = None
         self.heartbeat()
         try:
             self.parse()
@@ -67,6 +59,7 @@ class Device:
     def parse(self):
         self.attrs = {}
 
+        self.attrs['MAC'] = format_mac(self.data[7:13])
         self.attrs['IP'] = '%i.%i.%i.%i' % struct.unpack('BBBB',
                                                          self.data[13:17])
 
@@ -81,7 +74,14 @@ class Device:
             field_name, formatter = FIELDS.get(field_id,
                                                ('field-%i' % field_id,
                                                 format_binary))
-            self.attrs[field_name] = formatter(payload)
+            field_value = formatter(payload)
+            if (field_name in self.attrs and
+                    self.attrs[field_name] != field_value):
+                LOG.warning('Changing field %r from %r to %r' % (
+                    field_name,
+                    self.attrs[field_name],
+                    field_value))
+            self.attrs[field_name] = field_value
 
     @property
     def age(self):
@@ -101,6 +101,21 @@ class Device:
 
     def __hash__(self):
         return self.key
+
+    @property
+    def needs_broadcast(self):
+        # Apparently UAPs need to broadcast their presence for the
+        # network controller to pick them up. I'm not sure how to
+        # best determine which devices need that, but this is the
+        # logic to decide.
+        return (self.attrs.get('Name') in ['UBNT'] and
+                self.recv_addr != '0.0.0.0')
+
+    def __str__(self):
+        try:
+            return '%s %r' % (self.attrs['Model'], self.attrs['Name'])
+        except:
+            return 'Unknown-%s' % self.ip
 
 
 class DiscoveryProxy:
@@ -134,8 +149,11 @@ class DiscoveryProxy:
             LOG.info('Sending discover')
             for i, s in zip(self._disc_ifs, self.disc_socks):
                 LOG.debug('Discovering on interface %s' % i)
-                s.sendto(REQUEST, ('255.255.255.255', self._disc_port))
+                # FIXME: Do we need to also send the other request
+                # packet to pick up other devices?
+                s.sendto(REQUEST[0], ('255.255.255.255', self._disc_port))
             self._last_discover = time.time()
+            self.rebroadcast_some()
 
         # Expire any devices that we have not heard from in three
         # intervals
@@ -144,6 +162,29 @@ class DiscoveryProxy:
             if (now - device.ts) > (self._interval * 3):
                 LOG.info('Expiring device at %s' % device.ip)
                 del self._discovered[key]
+
+    def rebroadcast_some(self):
+        # Devices that need to be re-broadcasted must have been
+        # received once via non-multicast path so we know where they
+        # came from. The multicast and broadcast packets seem to be
+        # different sometimes, so we likely have two copies in our
+        # list. Find one from the same mac that has a recv_addr on it
+        # and re-broadcast to all other interfaces.
+        broadcast = [d for d in self._discovered.values() if d.needs_broadcast]
+        for device in broadcast:
+            try:
+                recv_addr = [d.recv_addr for d in self._discovered.values()
+                             if d.attrs.get('MAC') == device.attrs.get('MAC')
+                             and d.recv_addr][0]
+            except IndexError:
+                LOG.warning('Device %s needs rebroadcasting but cannot '
+                            'determine receive interface' % device)
+                continue
+
+            for a, s in zip(self._disc_ifs, self.disc_socks):
+                if a != recv_addr:
+                    LOG.info('Rebroadcasting %s on %s' % (device, a))
+                s.sendto(device.data, ('255.255.255.255', self._disc_port))
 
     def feed_discovery(self, remote):
         if not self._discovered:
@@ -156,6 +197,8 @@ class DiscoveryProxy:
             d.ip for d in self._discovered.values()))
         # Feed all our discovered devices to a remote requester
         for device in self._discovered.values():
+            if device.ip in self._disc_ifs:
+                raise Exception('Sending my own packet!')
             packet = (scapy.all.IP(src=device.ip, dst=remote[0]) /
                       scapy.all.UDP(sport=10001, dport=remote[1]) /
                       device.data)
@@ -168,7 +211,7 @@ class DiscoveryProxy:
                 LOG.error('Unable to send spoofed packet; am I root?')
                 break
 
-    def saw_device(self, device):
+    def saw_device(self, device, via=None):
         if device.key not in self._discovered:
             try:
                 LOG.info('New %s device %r found at %s (version %s)' % (
@@ -176,7 +219,16 @@ class DiscoveryProxy:
                     device.ip, device.attrs['Firmware version']))
             except KeyError:
                 LOG.info('New device found at %s' % device.ip)
+        else:
+            # If we also received this via multicast, we need to
+            # retain the interface affinity so we know not to
+            # rebroadcast it on the same subnet.
+            device.recv_addr = self._discovered[device.key].recv_addr
+
+        if via:
+            device.recv_addr = via
         self._discovered[device.key] = device
+        return device
 
     def process_loop(self):
         while True:
@@ -184,9 +236,11 @@ class DiscoveryProxy:
                                       10)
             if self.mcast_s in r:
                 data, remote = self.mcast_s.recvfrom(1024)
+                if remote[0] in self._disc_ifs:
+                    continue
                 LOG.debug('Multicast %s from %s:%i' % (
-                    data == REQUEST and 'request' or 'response', *remote))
-                if data == REQUEST and remote[0] not in self._disc_ifs:
+                    data in REQUEST and 'request' or 'response', *remote))
+                if data in REQUEST:
                     # If this is a request packet from someone other
                     # than ourselves, we feed them the devices we know
                     # about. We also trigger another discovery if it
@@ -197,16 +251,19 @@ class DiscoveryProxy:
                     # time with a fresh list.
                     self.feed_discovery(remote)
                     self.discovery_tick()
-                elif data != REQUEST:
+                else:
                     self.saw_device(Device(remote[0], data))
 
-            for s in self.disc_socks:
+            for a, s in zip(self._disc_ifs, self.disc_socks):
                 if s in r:
                     data, remote = s.recvfrom(1024)
-                    LOG.debug('Discovery %s from %s:%i' % (
-                        data == REQUEST and 'request' or 'response', *remote))
-                    if data != REQUEST:
-                        self.saw_device(Device(remote[0], data))
+                    if remote[0] in self._disc_ifs:
+                        continue
+                    LOG.debug('Discovery %s via %s from %s:%i' % (
+                        data in REQUEST and 'request' or 'response', a,
+                        *remote))
+                    if data not in REQUEST:
+                        device = self.saw_device(Device(remote[0], data), a)
 
 
 def main():
