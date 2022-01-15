@@ -91,4 +91,5 @@ Tested Devices
 * UVC G4 Bullet
 * UAP (BZ2)
 * UAP-Pro (U7P)
+* UAP-AC-Pro-Gen2 (U7PG2)
 * Android unifi-protect app

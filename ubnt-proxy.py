@@ -108,7 +108,8 @@ class Device:
         # network controller to pick them up. I'm not sure how to
         # best determine which devices need that, but this is the
         # logic to decide.
-        return (self.attrs.get('Name') in ['UBNT'] and
+        return ((self.attrs.get('Name') in ['UBNT'] or
+                 'UAP' in self.attrs.get('Name', '')) and
                 self.recv_addr != '0.0.0.0')
 
     def __str__(self):
