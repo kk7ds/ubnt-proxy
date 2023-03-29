@@ -10,6 +10,8 @@ import time
 
 import scapy.all
 
+scapy.all.conf.sniff_promisc = 0
+
 # Apparently there are two types of request packets, the first seems
 # to be from protect, the second maybe network?
 REQUEST = [bytes([1, 0, 0, 0]),
