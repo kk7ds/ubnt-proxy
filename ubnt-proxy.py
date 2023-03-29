@@ -124,10 +124,12 @@ class Device:
 class DiscoveryProxy:
     """A cross-subnet Unifi Discovery proxy"""
 
-    def __init__(self, disc_ifs, mcast_group, disc_port, interval=10):
+    def __init__(self, disc_ifs, mcast_group, disc_port, interval=10,
+                 gratuitous=None):
         self._disc_ifs = disc_ifs
         self._disc_port = disc_port
         self._interval = interval
+        self._gratuitous = gratuitous or []
 
         self.mcast_s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.mcast_s.bind(('', self._disc_port))
@@ -268,6 +270,9 @@ class DiscoveryProxy:
                     if data not in REQUEST:
                         device = self.saw_device(Device(remote[0], data), a)
 
+            for remote in self._gratuitous:
+                self.feed_discovery((remote, 10001))
+
 
 def main():
     p = argparse.ArgumentParser()
@@ -283,6 +288,8 @@ def main():
                    help='Discovery port')
     p.add_argument('--discovery-interval', default=10,
                    help='How often to trigger our own discovery')
+    p.add_argument('--gratuitous', action='append',
+                   help='Send gratuitous updates to this host')
     args = p.parse_args()
 
     if args.debug:
@@ -296,7 +303,8 @@ def main():
     try:
         proxy = DiscoveryProxy(args.unifi_if, args.multicast_group,
                                args.discovery_port,
-                               interval=args.discovery_interval)
+                               interval=args.discovery_interval,
+                               gratuitous=args.gratuitous)
     except OSError as e:
         LOG.error('Unable to start proxy: %s' % e)
         return 1
